@@ -87,15 +87,33 @@ redis:
 
 Both work for `app-config` and `application-properties`. Pick one and stay consistent.
 
-## Environments (dev / staging / prod)
+## Environment variable resolution (built-in, ≥ 0.3.x)
 
-PySpring doesn't ship a Spring-style `application-{profile}.yaml` loader out of the box. Common approaches users take:
+PySpring resolves `${VAR}` and `${VAR:default}` placeholders inside `application-properties.json` / `.yaml` at load time, **before** Pydantic validation. This applies recursively through nested dicts and lists.
 
-1. **Per-environment file + symlink** — keep `application-properties.dev.json` / `.prod.json` in the repo, symlink the active one to `application-properties.json` at deploy time.
-2. **Environment variable interpolation** — put values in env vars and reference them inside `Properties` field defaults or a `BeanCollection` factory that reads `os.environ`.
-3. **Templated config** — generate `application-properties.json` at container start from a template + env vars.
+```json
+{
+    "database": {
+        "host": "${DB_HOST:localhost}",
+        "port": 5432,
+        "password": "${DB_PASSWORD}"
+    },
+    "line": {
+        "channel_secret": "${LINE_CHANNEL_SECRET}"
+    }
+}
+```
 
-Option 2 is the simplest for secrets (never commit them); option 1 is cleanest for structural differences between environments.
+Rules:
+
+- `${VAR}` — required; if `VAR` is unset, startup fails with `EnvVarNotFoundError` (fail-fast, the whole point).
+- `${VAR:default}` — falls back to `default` (a literal string) if `VAR` is unset. Empty default `${VAR:}` is allowed and yields `""`.
+- Substitution is **string-level**: the resolved value goes through Pydantic, so `port: "${DB_PORT:5432}"` will coerce to `int`.
+- Placeholders can appear inside larger strings: `"url": "postgres://${DB_HOST}:5432/app"` works.
+- Pattern is `\$\{([^}:]+)(?::([^}]*))?\}` — no escaping, no nested `${}`, no shell-style `${VAR:-default}` (use `${VAR:default}`).
+- Applied **only to `application-properties`**, not `app-config.json`. Don't put `${...}` in `app-config.json` — it won't be resolved.
+
+This is the preferred way to handle secrets and per-environment values. The earlier workarounds (per-env file + symlink, BeanCollection reading `os.environ`, container-start templating) are no longer needed for the common case — reach for them only if you need conditional structure that placeholders can't express.
 
 ## First-run generation
 
