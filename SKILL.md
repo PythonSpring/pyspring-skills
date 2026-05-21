@@ -154,7 +154,7 @@ The mapping decorators are FastAPI route decorators under the hood — path para
 
 ### 4. BeanCollection — integrating third-party code
 
-When the class you want to inject is *not* yours (you can't make it extend `Component`), register it via a factory method whose name starts with `create` and has a return type annotation:
+When the class you want to inject is *not* yours (you can't make it extend `Component`), register it via a factory method whose name starts with `create` and has a return type annotation. **The factory must be a `@classmethod`** — PySpring calls it via `getattr(cls, name)()` with no instance, so an instance method blows up with `missing 1 required positional argument: 'self'`. Dependencies are injected onto the class itself, so access them through `cls`:
 
 ```python
 from py_spring_core import BeanCollection, Properties
@@ -168,13 +168,19 @@ class RedisProperties(Properties):
 
 
 class InfrastructureBeans(BeanCollection):
-    redis_properties: RedisProperties  # Properties are injected before create_* is called
+    redis_properties: RedisProperties  # Injected onto the class before create_* is called
 
-    def create_redis_client(self) -> Redis:        # ← return type annotation is REQUIRED
-        return Redis(host=self.redis_properties.host, port=self.redis_properties.port)
+    @classmethod
+    def create_redis_client(cls) -> Redis:        # ← @classmethod + return type are both REQUIRED
+        return Redis(host=cls.redis_properties.host, port=cls.redis_properties.port)
 ```
 
 Now any component can inject `redis: Redis`. The return type is what PySpring uses as the registration key, so it must be present and accurate.
+
+**Critical caveat — the bean validator does a literal name match.** After calling the factory, PySpring asserts `return_annotation.__name__ == bean.__class__.__name__` and raises `InvalidBeanError` if they differ. This breaks for libraries that synthesize client classes at runtime — the canonical example is **boto3**: the type stub is `mypy_boto3_sqs.client.SQSClient`, but the runtime class name is just `"SQS"`, so the validator rejects it. Two ways out:
+
+- **Preferred:** skip `BeanCollection` for these clients. Create them inside a regular `Component.post_construct` using injected `Properties`. The boto3 client has no DI dependencies of its own, so there is no benefit to making it a separate bean.
+- **If you genuinely need the client as an injectable bean** (e.g. multiple components reuse it): wrap it in a thin class whose `__class__.__name__` matches the annotation — `class SqsGateway: def __init__(self, raw): self.raw = raw` — and have the factory return the wrapper.
 
 ## The top mistakes — guard against these
 
@@ -196,19 +202,22 @@ class Cache(Component):
         self.data = self.db.load()
 ```
 
-**2. Forgetting the return type annotation on a `create_*` method.** Without it, PySpring has no type to register the bean under, and injection silently fails.
+**2. Forgetting the return type annotation on a `create_*` method, or writing it as an instance method.** Without the annotation, PySpring has no type to register the bean under, and injection silently fails. Without `@classmethod`, PySpring can't even call the factory — it invokes `cls.create_xxx()` with no instance, producing `missing 1 required positional argument: 'self'`.
 
 ```python
-# WRONG — bean won't be registered
+# WRONG — no annotation, no @classmethod, uses self
 def create_redis_client(self):
     return Redis(...)
 
 # RIGHT
-def create_redis_client(self) -> Redis:
-    return Redis(...)
+@classmethod
+def create_redis_client(cls) -> Redis:
+    return Redis(host=cls.redis_properties.host)
 ```
 
 **3. Method name doesn't start with `create`.** `make_redis_client`, `build_redis_client`, `get_redis_client` are all ignored. The convention is strict.
+
+**3a. Return-type class name doesn't match the runtime object's class name.** PySpring validates `return_annotation.__name__ == bean.__class__.__name__` and aborts startup with `InvalidBeanError` otherwise. This fails on libraries that synthesize client classes at runtime — notably **boto3**, where the stub is `SQSClient` but the runtime class is `"SQS"`. Either build the client inside a `Component.post_construct` (skipping `BeanCollection` entirely), or wrap it in a thin class whose name matches your annotation.
 
 **4. Multiple implementations of the same base type with no qualifier.** If two classes extend `AbstractNotifier`, injecting `notifier: AbstractNotifier` is ambiguous. Use `Annotated[AbstractNotifier, "EmailNotifier"]` where the string is the *class name* of the implementation. See `references/qualifiers-and-lifecycle.md` for the pattern.
 
@@ -269,7 +278,7 @@ Before declaring code "done":
 
 1. Every field used inside a method exists as a class-level type annotation — otherwise DI won't populate it.
 2. Setup code runs in `post_construct`, not `__init__`.
-3. Every `create_*` method in a `BeanCollection` has a return type annotation.
+3. Every `create_*` method in a `BeanCollection` is a `@classmethod` taking `cls`, has a return type annotation, and the annotation's `__name__` matches the runtime `__class__.__name__` of what it returns (watch out for boto3 and other libraries that generate client classes dynamically).
 4. Every `Properties` subclass has `__key__`.
 5. Controllers set `class Config: prefix = "..."` — without it, routes register at root and collisions become likely.
 6. If the feature needs `pyspring-scheduler`, the user's `main.py` passes `entity_providers=[provide_scheduler()]` to `PySpringApplication`.
